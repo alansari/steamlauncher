@@ -7,6 +7,7 @@ import psutil
 import time
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
 
 # Initialize Pygame and controller
 pygame.init()
@@ -23,8 +24,8 @@ screen = pygame.display.set_mode((infoObject.current_w, infoObject.current_h), p
 pygame.display.set_caption("Steam Game Launcher")
 
 # Constants for layout (adjust based on screen size)
-POSTER_WIDTH = int(infoObject.current_w * 0.1)  # 10% of screen width
-POSTER_HEIGHT = int(POSTER_WIDTH * 1.5)  # 3:2 aspect ratio
+POSTER_WIDTH = int(infoObject.current_w * 0.15)  # 15% of screen width
+POSTER_HEIGHT = int(POSTER_WIDTH * .5)  # 2:1 aspect ratio
 MARGIN = int(infoObject.current_w * 0.02)  # 2% of screen width
 GAMES_PER_ROW = (infoObject.current_w - MARGIN) // (POSTER_WIDTH + MARGIN)
 
@@ -62,40 +63,6 @@ def fetch_and_resize_poster(game_id, game_name, save_directory='/home/default/.l
     
     # Check if the image already exists to avoid overwriting
     if not os.path.exists(os.path.join(save_directory, f'{game_id}.png')):
-        # Create a blank image with black background
-        image = Image.new('RGB', (600, 800), 'black')
-        draw = ImageDraw.Draw(image)
-
-        # Define the font and text size
-        # Draw a Title to show that it is steam-headless managed
-        font = ImageFont.truetype("arial.ttf", 40)
-        draw.text((150, 20), "Steam Headless", fill='white', font=font)
-
-        # Draw tha game name at the footer
-        text_width = draw.textlength(str(game_name), font=font)
-        name_x_offset = (image.width - text_width) / 2
-
-        # Draw the text with wrapping if necessary
-        lines = []
-        words = game_name.split(' ')
-        line = ''
-        for word in words:
-            test_line = line + word + ' '
-            test_width = draw.textlength(test_line, font=font)
-            if test_width <= image.width:
-                line = test_line
-            else:
-                lines.append(line)
-                line = word + ' '
-        lines.append(line)
-
-        # Calculate the y-coordinate for each line of text
-        name_y_offset = 600  # Starting y-coordinate
-        for i, line in enumerate(lines):
-            name_x_offset = (image.width - draw.textlength(str(line), font=font)) / 2
-            draw.text((name_x_offset, name_y_offset), line, fill='white', font=font)
-            name_y_offset += 40
-
         # Fetch the game poster from Steam API
         url = f'https://store.steampowered.com/api/appdetails?appids={game_id}'
         response = requests.get(url)
@@ -103,23 +70,17 @@ def fetch_and_resize_poster(game_id, game_name, save_directory='/home/default/.l
             data = response.json()
             if str(game_id) in data and data[str(game_id)]['success']:
                 poster_url = data[str(game_id)]['data']['header_image']
-
-                response_poster = requests.get(poster_url)
-                if response_poster.status_code == 200:
-                    # Open the fetched image and resize it to fit
-                    poster_image = Image.open(requests.get(poster_url, stream=True).raw)
-                    height = int((600 / poster_image.width) * poster_image.height)
-                    resized_poster = poster_image.resize((600, height))
+                img_response = requests.get(poster_url)
+                if img_response.status_code == 200:
+                    img = Image.open(BytesIO(img_response.content))
                     
-                    # Calculate the position to center the image on the main image
-                    x_offset = 0
-                    y_offset = (800 - height) // 2
+                    # Optionally resize the image here, e.g., img = img.resize((width, height))
+                    img = img.resize((200, 100))
                     
-                    # Paste the resized poster onto the black background
-                    image.paste(resized_poster, (x_offset, y_offset))
-                
-        # Save the final image appid.png
-        image.save(f'{save_directory}/{game_id}.png')
+                    # Save the image as appid.png
+                    img.save(f'{save_directory}/{game_id}.png')
+                else:
+                    print(f'Failed to fetch image from {poster_url}')
 
 def get_steam_games():
     steam_path = os.path.expanduser("~/.steam/steam")
@@ -144,12 +105,23 @@ def get_steam_games():
                     
                     # Check if the game name contains any of the filtered keywords
                     if not any(keyword in game_name.lower() for keyword in filtered_keywords):
-                        #fetch_and_resize_poster(appid, game_name)
-                        games.append({
-                            "name": game_name,
-                            "appid": appid,
-                            "poster_path": os.path.join(poster_dir, f"{appid}.png")
-                        })
+                        # Check if there is a parent appid and use it instead
+                        if "parent_appid" in game_info:
+                            appid = game_info["parent_appid"]
+                            games.append({
+                                "name": game_name,
+                                "appid": appid,
+                                "poster_path": os.path.join(poster_dir, f"{appid}.png")
+                            })
+                            fetch_and_resize_poster(appid, game_name)
+                        else:
+                            games.append({
+                                "name": game_name,
+                                "appid": appid,
+                                "poster_path": os.path.join(poster_dir, f"{appid}.png")
+                            })
+                            fetch_and_resize_poster(appid, game_name)
+                        
     return games
 
 def launch_game(appid):
