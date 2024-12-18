@@ -1,260 +1,376 @@
 import os
-import subprocess
-import pygame
 import vdf
-import textwrap
-import psutil
-import time
+import sqlite3
+from sqlmodel import create_engine, SQLModel, Field, Session, select
+import pygame
+import subprocess
 import requests
-from PIL import Image, ImageDraw, ImageFont
+import warnings
+from PIL import Image, ImageOps
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 
-# Initialize Pygame and controller
-pygame.init()
-pygame.joystick.init()
-joysticks = [pygame.joystick.Joystick(i) for i in range(pygame.joystick.get_count())]
-for joystick in joysticks:
-    joystick.init()
+# Define the Game model for SQLModel
+class Game(SQLModel, table=True):
+    app_id: int = Field(default=None, primary_key=True)
+    name: str
+    install_path: str
+    is_favorite: bool = False
+    poster_path: str = ''  # Default to an empty string
 
-# Get information about the current display
-infoObject = pygame.display.Info()
+# Database setup
+sqlite_file_name = "games.db"
+sqlite_url = f"sqlite:///{sqlite_file_name}"
 
-# Set up the display in fullscreen mode
-screen = pygame.display.set_mode((infoObject.current_w, infoObject.current_h), pygame.FULLSCREEN)
-pygame.display.set_caption("Steam Game Launcher")
+engine = create_engine(sqlite_url)
 
-# Constants for layout (adjust based on screen size)
-POSTER_WIDTH = int(infoObject.current_w * 0.15)  # 15% of screen width
-POSTER_HEIGHT = int(POSTER_WIDTH * .5)  # 2:1 aspect ratio
-MARGIN = int(infoObject.current_w * 0.02)  # 2% of screen width
-GAMES_PER_ROW = (infoObject.current_w - MARGIN) // (POSTER_WIDTH + MARGIN)
+SQLModel.metadata.create_all(engine)
 
-# Function to render wrapped text
-def render_wrapped_text(text, font, max_width, max_height, color):
-    words = text.split()
-    lines = []
-    current_line = []
-    for word in words:
-        test_line = ' '.join(current_line + [word])
-        if font.size(test_line)[0] <= max_width:
-            current_line.append(word)
-        else:
-            lines.append(' '.join(current_line))
-            current_line = [word]
-    lines.append(' '.join(current_line))
+# Suppress the libpng warning about incorrect sRGB profile
+warnings.filterwarnings("ignore", category=UserWarning, message=".*known incorrect sRGB profile.*")
 
-    rendered_lines = []
-    for line in lines:
-        rendered_lines.append(font.render(line, True, color))
+def scan_steam_games():
+    vdf_path = os.path.expanduser("~/.steam/steam/steamapps/libraryfolders.vdf")
+    
+    if not os.path.exists(vdf_path):
+        print("Steam library file not found!")
+        return
 
-    total_height = sum(line.get_height() for line in rendered_lines)
-    scale = min(1, max_height / total_height)
+    with open(vdf_path, 'r') as f:
+        data = vdf.load(f)
 
-    scaled_lines = [pygame.transform.scale(line, (int(line.get_width() * scale), int(line.get_height() * scale))) for line in rendered_lines]
+    games = {}
+    for lib in data['libraryfolders'].values():
+        appmanifest_files = [f for f in os.listdir(lib['path'] + '/steamapps/') if f.startswith('appmanifest_')]
+        for file in appmanifest_files:
+            manifest_path = os.path.join(lib['path'], 'steamapps', file)
+            with open(manifest_path, 'r') as mf:
+                manifest_data = vdf.load(mf)
 
-    return scaled_lines
+            # Extract the app_id from the AppState section
+            try:
+                app_id = int(manifest_data['AppState']['appid'])
+            except (KeyError, ValueError) as e:
+                print(f"Failed to extract app_id from {file}: {e}")
+                continue
 
-# Function to fetch and resize Steam game posters
-# TODO Center text on the image if no header image is found
-def fetch_and_resize_poster(game_id, game_name, save_directory='/home/default/.local/share/posters'):
+            game_name = manifest_data['AppState'].get('name')
+            install_path = manifest_data['AppState'].get('installdir', '')
+            parent_app_id = manifest_data['AppState'].get('parentappid')
+
+            # Skip entries with "proton" or "runtime" in the name
+            if not game_name or 'proton' in game_name.lower() or 'runtime' in game_name.lower():
+                continue
+
+            if parent_app_id:
+                try:
+                    parent_app_id = int(parent_app_id)
+                    # Use the parent app_id as the key
+                    games[parent_app_id] = {
+                        'name': game_name,
+                        'install_path': install_path
+                    }
+                except ValueError as e:
+                    print(f"Failed to convert parentappid from {file}: {e}")
+            else:
+                # Use the current app_id as the key
+                games[app_id] = {
+                    'name': game_name,
+                    'install_path': install_path
+                }
+
+    return games
+
+def fetch_and_resize_poster(game_id, game_name, save_directory='./posters', session: Session = None):
     # Create the directory if it doesn't exist
     if not os.path.exists(save_directory):
         os.makedirs(save_directory)
-    
+
+    poster_path = os.path.join(save_directory, f'{game_id}.png')
+
     # Check if the image already exists to avoid overwriting
-    if not os.path.exists(os.path.join(save_directory, f'{game_id}.png')):
+    if not os.path.exists(poster_path):
         # Fetch the game poster from Steam API
         url = f'https://store.steampowered.com/api/appdetails?appids={game_id}'
         response = requests.get(url)
         if response.status_code == 200:
             data = response.json()
             if str(game_id) in data and data[str(game_id)]['success']:
-                poster_url = data[str(game_id)]['data']['header_image']
-                img_response = requests.get(poster_url)
-                if img_response.status_code == 200:
-                    img = Image.open(BytesIO(img_response.content))
-                    
-                    # Optionally resize the image here, e.g., img = img.resize((width, height))
-                    img = img.resize((200, 100))
-                    
-                    # Save the image as appid.png
-                    img.save(f'{save_directory}/{game_id}.png')
+                poster_url = data[str(game_id)]['data'].get('header_image')
+                if poster_url:
+                    img_response = requests.get(poster_url)
+                    if img_response.status_code == 200:
+                        try:
+                            img = Image.open(BytesIO(img_response.content))
+
+                            img = img.resize((150, 70), Image.Resampling.LANCZOS)
+
+                            # Save the image as appid.png
+                            img.save(poster_path)
+
+                            # Update the poster_path in the database
+                            if session:
+                                game = session.get(Game, game_id)
+                                if game:
+                                    game.poster_path = poster_path
+                                    session.add(game)
+                                    session.commit()
+                        except Exception as e:
+                            print(f'Failed to process image from {poster_url}: {e}')
+                    else:
+                        print(f'Failed to fetch image from {poster_url}')
                 else:
-                    print(f'Failed to fetch image from {poster_url}')
+                    print(f"No header_image found for game ID: {game_id}")
+            else:
+                print(f'Failed to get data for game ID: {game_id} from Steam API')
+        else:
+            print(f'Failed to get data from Steam API for game ID: {game_id}')
 
-def get_steam_games():
-    steam_path = os.path.expanduser("~/.steam/steam")
-    library_folders_path = os.path.join(steam_path, "steamapps/libraryfolders.vdf")
-    
-    with open(library_folders_path, "r") as f:
-        library_folders = vdf.load(f)
-    
-    games = []
-    filtered_keywords = ["steam", "proton"]
-    poster_dir = os.path.expanduser("~/.local/share/posters")
-    
-    for folder in library_folders["libraryfolders"].values():
-        apps_path = os.path.join(folder["path"], "steamapps")
-        for filename in os.listdir(apps_path):
-            if filename.startswith("appmanifest_") and filename.endswith(".acf"):
-                with open(os.path.join(apps_path, filename), "r") as f:
-                    manifest = vdf.load(f)
-                    game_info = manifest["AppState"]
-                    game_name = game_info["name"]
-                    appid = game_info["appid"]
-                    
-                    # Check if the game name contains any of the filtered keywords
-                    if not any(keyword in game_name.lower() for keyword in filtered_keywords):
-                        # Check if there is a parent appid and use it instead
-                        if "parent_appid" in game_info:
-                            appid = game_info["parent_appid"]
-                            games.append({
-                                "name": game_name,
-                                "appid": appid,
-                                "poster_path": os.path.join(poster_dir, f"{appid}.png")
-                            })
-                            fetch_and_resize_poster(appid, game_name)
-                        else:
-                            games.append({
-                                "name": game_name,
-                                "appid": appid,
-                                "poster_path": os.path.join(poster_dir, f"{appid}.png")
-                            })
-                            fetch_and_resize_poster(appid, game_name)
-                        
-    return games
+    return poster_path
 
-def launch_game(appid):
+def save_games_to_db(games):
+    with Session(engine) as session:
+        for app_id, game_info in games.items():
+            # Check if the game already exists in the database
+            existing_game = session.get(Game, app_id)
+
+            if existing_game:
+                # Update the existing game record
+                existing_game.name = game_info['name']
+                existing_game.install_path = game_info['install_path']
+            else:
+                # Insert a new game record
+                new_game = Game(app_id=app_id, name=game_info['name'], install_path=game_info['install_path'])
+                session.add(new_game)
+
+        session.commit()
+
+def load_games_from_db(filter_favorites=False):
+    with Session(engine) as session:
+        if filter_favorites:
+            statement = select(Game).where(Game.is_favorite == True).order_by(Game.name)
+        else:
+            statement = select(Game).order_by(Game.name)  # Sort by name alphabetically
+        games = session.exec(statement).all()
+        return games
+
+def toggle_favorite(app_id):
+    with Session(engine) as session:
+        game = session.get(Game, app_id)
+        if game:
+            game.is_favorite = not game.is_favorite
+            session.add(game)
+            session.commit()
+
+def launch_game(app_id):
+    subprocess.Popen(["steam", f"steam://rungameid/{app_id}"])
+
+def main():
+    # Scan and save games to the database
+    games = scan_steam_games()
+    save_games_to_db(games)
+
+    # Load games from the database
+    games_list = load_games_from_db()
+    pygame.init()
+
+    # Load the star image
     try:
-        # Launch the game using Steam's URL protocol
-        process = subprocess.Popen(["steam", f"steam://rungameid/{appid}"])
-        # Exit the Pygame script
-        pygame.quit()
-        
-        # time.sleep(10)
-        
-        # steam_process = psutil.Process(process.pid)
-        
-        # while True:
-        #     if not steam_process.is_running() or steam_process.status() == psutil.STATUS_ZOMBIE:
-        #         break
-            
-        #     # Check if any child process is the game
-        #     children = steam_process.children(recursive=True)
-        #     if not any(child.name().lower() != "steam" for child in children):
-        #         break
-            
-        #     time.sleep(1)
-        
-        # for child in steam_process.children(recursive=True):
-        #     child.terminate()
-        # steam_process.terminate()
-        
-        # print("Game has exited")
-        
-        
+        star_image = pygame.image.load("./assets/star.png").convert_alpha()
+        star_image = pygame.transform.scale(star_image, (30, 30)) 
     except Exception as e:
-        print(f"Error launching: {e}")
+        print(f"Failed to load star image: {e}")
+        star_image = None
 
+    # Initialize joystick support
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0:
+        print("No joysticks connected")
+    else:
+        pygame.joystick.init()
+        joysticks = [pygame.joystick.Joystick(i) for i in range(pygame.joystick.get_count())]
+        for joystick in joysticks:
+            joystick.init()
+        joystick = pygame.joystick.Joystick(0)
+        print(f"Using joystick: {joystick.get_name()}")
 
-# Get installed games
-games = get_steam_games()
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    font = pygame.font.Font(None, 36)
+    small_font = pygame.font.Font(None, 24)
+    clock = pygame.time.Clock()
 
-# Main game loop
-running = True
-selected_game = 0
-scroll_offset = 0
-scroll_speed = 50 
+    # Constants
+    POSTER_HEIGHT = 100
+    FOOTER_HEIGHT = 100
+    SPACING_BETWEEN_ITEMS = 10
 
-while running:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        elif event.type == pygame.JOYBUTTONDOWN:
-            if event.button == 0:  # A button
-                launch_game(sorted_games[selected_game]["appid"])
-            elif event.button == 5:  # R1 button (scroll down)
-                max_scroll = max(0, total_rows * (POSTER_HEIGHT + MARGIN) - screen.get_height())
-                scroll_offset = min(max_scroll, scroll_offset + scroll_speed)
-            elif event.button == 4:  # R2 button (scroll up)
-                scroll_offset = max(0, scroll_offset - scroll_speed)
-        elif event.type == pygame.JOYHATMOTION:
-            if event.value[0] == -1:  # Left on D-pad
-                selected_game = (selected_game - 1) % len(games)
-            elif event.value[0] == 1:  # Right on D-pad
-                selected_game = (selected_game + 1) % len(games)
-            elif event.value[1] == 1:  # Up on D-pad
-                selected_game = (selected_game - GAMES_PER_ROW) % len(games)
-            elif event.value[1] == -1:  # Down on D-pad
-                selected_game = (selected_game + GAMES_PER_ROW) % len(games)
-        elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:  # Esc key
+    # Calculate screen dimensions
+    screen_width, screen_height = screen.get_size()
+
+    # Calculate the available height for game entries
+    available_height_for_games = screen_height - FOOTER_HEIGHT
+
+    # Calculate items per page
+    item_height = POSTER_HEIGHT + SPACING_BETWEEN_ITEMS
+    items_per_page = available_height_for_games // item_height
+
+    selected_index = 0
+    visible_range_start = 0
+
+    running = True
+    filter_favorites = False
+
+    # Use ThreadPoolExecutor for background image fetching
+    executor = ThreadPoolExecutor(max_workers=5)
+
+    # Dictionary to store future objects for posters
+    poster_futures = {}
+
+    def skip_to_next_letter(games_list, current_index):
+        if not games_list:
+            return 0
+        current_initial = games_list[current_index].name[0].upper()
+        next_initials = [game.name[0].upper() for game in games_list if game.name[0].upper() > current_initial]
+        if not next_initials:
+            return 0
+        next_initial = min(next_initials)
+        for i, game in enumerate(games_list):
+            if game.name[0].upper() == next_initial:
+                return i
+        return 0
+    
+    def skip_to_previous_letter(games_list, current_index):
+        if not games_list:
+            return 0
+        current_initial = games_list[current_index].name[0].upper()
+        previous_initials = [game.name[0].upper() for game in games_list if game.name[0].upper() < current_initial]
+        if not previous_initials:
+            return 0
+        previous_initial = max(previous_initials)
+        for i, game in enumerate(games_list):
+            if game.name[0].upper() == previous_initial:
+                return i
+        return 0
+
+    # The legend
+    legend_text = [
+        "A: Launch Game | B: Exit | Y: Toggle Favorite",
+        "Start: Toggle Favorites | L2/R2: Skip to Next Letter"
+    ]
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
                 running = False
-            elif event.key == pygame.K_LEFT:
-                selected_game = (selected_game - 1) % len(games)
-            elif event.key == pygame.K_RIGHT:
-                selected_game = (selected_game + 1) % len(games)
-            elif event.key == pygame.K_UP:
-                selected_game = (selected_game - GAMES_PER_ROW) % len(games)
-            elif event.key == pygame.K_DOWN:
-                selected_game = (selected_game + GAMES_PER_ROW) % len(games)
-            elif event.key == pygame.K_RETURN:
-                launch_game(sorted_games[selected_game]["appid"])
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button == 4:  # Scroll up
-                scroll_offset = max(0, scroll_offset - scroll_speed)
-            elif event.button == 5:  # Scroll down
-                max_scroll = max(0, total_rows * (POSTER_HEIGHT + MARGIN) - screen.get_height())
-                scroll_offset = min(max_scroll, scroll_offset + scroll_speed)
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_UP:
+                    selected_index = (selected_index - 1) % len(games_list)
+                    if selected_index < visible_range_start:
+                        visible_range_start = max(0, selected_index)
+                elif event.key == pygame.K_DOWN:
+                    selected_index = (selected_index + 1) % len(games_list)
+                    if selected_index >= visible_range_start + items_per_page:
+                        visible_range_start = min(len(games_list) - items_per_page, selected_index - items_per_page + 1)
+                elif event.key == pygame.K_PAGEUP:
+                    selected_index = skip_to_previous_letter(games_list, selected_index)
+                    visible_range_start = max(0, selected_index - items_per_page + 1)
+                elif event.key == pygame.K_PAGEDOWN:
+                    selected_index = skip_to_next_letter(games_list, selected_index)
+                    visible_range_start = max(0, selected_index - items_per_page + 1)
+                elif event.key == pygame.K_RETURN:
+                    launch_game(games_list[selected_index].app_id)
+                elif event.key == pygame.K_BACKSPACE:
+                    filter_favorites = not filter_favorites
+                    games_list = load_games_from_db(filter_favorites=filter_favorites)
+                    selected_index = 0
+                    visible_range_start = 0
+                elif event.key == pygame.K_f:
+                    toggle_favorite(games_list[selected_index].app_id)
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 3:  # Y button on Xbox controller (button index is 3)
+                    toggle_favorite(games_list[selected_index].app_id)
+                elif event.button == 7:  # Start button on Xbox controller (button index is 7)
+                    filter_favorites = not filter_favorites
+                    games_list = load_games_from_db(filter_favorites=filter_favorites)
+                    selected_index = 0
+                    visible_range_start = 0
+                elif event.button == 0:  # A button on Xbox controller (button index is 0)
+                    launch_game(games_list[selected_index].app_id)
+                elif event.button == 1:  # B button on Xbox controller (button index is 1)
+                    running = False
+                elif event.button == 6:  # L2 button on Xbox controller (button index is 6)
+                    selected_index = skip_to_next_letter(games_list, selected_index)
+                    visible_range_start = max(0, selected_index - items_per_page + 1)
+                elif event.button == 7:  # R2 button on Xbox controller (button index is 7)
+                    selected_index = skip_to_next_letter(games_list, selected_index)
+                    visible_range_start = max(0, selected_index - items_per_page + 1)
+            elif event.type == pygame.JOYAXISMOTION:
+                if event.axis == 1:  # Left thumbstick vertical axis (axis index is 1)
+                    if event.value < -0.5:  # Up
+                        selected_index = (selected_index - 1) % len(games_list)
+                        if selected_index < visible_range_start:
+                            visible_range_start = max(0, selected_index)
+                    elif event.value > 0.5:  # Down
+                        selected_index = (selected_index + 1) % len(games_list)
+                        if selected_index >= visible_range_start + items_per_page:
+                            visible_range_start = min(len(games_list) - items_per_page, selected_index - items_per_page + 1)
+                elif event.axis == 0:  # Left thumbstick horizontal axis (axis index is 0)
+                    pass  # You can add additional actions if needed
 
-    # Clear the screen
-    screen.fill((0, 0, 0))
+        screen.fill((0, 0, 0))
+        
+        visible_games = games_list[visible_range_start:visible_range_start + items_per_page]
+        for i, game in enumerate(visible_games):
+            color = (255, 255, 255) if (selected_index - visible_range_start == i) else (180, 180, 180)
+            
+            # Calculate vertical position based on item height and spacing
+            y_offset = 40 + i * item_height
+            
+            # Display the game name
+            text = font.render(game.name, True, color)
+            screen.blit(text, (250, y_offset))  # Adjusted to make space for the star image
+            
+            # Load and display the poster if it exists
+            if game.poster_path:
+                try:
+                    poster_image = pygame.image.load(game.poster_path).convert_alpha()
+                    screen.blit(poster_image, (10, y_offset - 5))  # Adjusted to align with text better
+                    
+                    # Display the star image next to the poster if the game is a favorite
+                    if game.is_favorite and star_image is not None:
+                        # Get the dimensions of the poster image
+                        poster_rect = poster_image.get_rect(topleft=(10, y_offset - 5))
+                        # Calculate the position for the star image at the top-right corner of the poster
+                        star_position = (poster_rect.topright[0] - star_image.get_width() + 5, poster_rect.topright[1] - 5)
+                        screen.blit(star_image, star_position)
+                except Exception as e:
+                    print(f"Failed to load image {game.poster_path}: {e}")
+            else:
+                # If the poster is not yet loaded, fetch it in the background
+                if game.app_id not in poster_futures:
+                    with Session(engine) as session:
+                        future = executor.submit(fetch_and_resize_poster, game.app_id, game.name, session=session)
+                        poster_futures[game.app_id] = future
+                elif poster_futures[game.app_id].done():
+                    try:
+                        poster_path = poster_futures[game.app_id].result()
+                        if poster_path:
+                            game.poster_path = poster_path
+                    except Exception as e:
+                        print(f"Error processing future for game ID {game.app_id}: {e}")
+        
+        # Display the legend at the bottom of the screen
+        footer_y_offset = screen.get_height() - FOOTER_HEIGHT 
+        for i, line in enumerate(legend_text):
+            text = small_font.render(line, True, (255, 255, 255))
+            screen.blit(text, (screen.get_width() // 2 - text.get_width() // 2, footer_y_offset + i * 30)) 
+        
+        pygame.display.flip()
+        clock.tick(60)
 
-    # Calculate total rows and visible rows
-    total_rows = (len(games) - 1) // GAMES_PER_ROW + 1
-    visible_rows = (screen.get_height() - MARGIN) // (POSTER_HEIGHT + MARGIN)
+    pygame.quit()
 
-    # Sort games alphabetically by name
-    sorted_games = sorted(games, key=lambda x: x['name'].lower())
-
-    # Display game posters in a grid
-    for i, game in enumerate(sorted_games):
-        row = i // GAMES_PER_ROW
-        col = i % GAMES_PER_ROW
-        x = col * (POSTER_WIDTH + MARGIN) + MARGIN
-        y = (row * (POSTER_HEIGHT + MARGIN) + MARGIN) - scroll_offset
-
-        if -POSTER_HEIGHT <= y < screen.get_height():
-            # Draw background for the game tile
-            pygame.draw.rect(screen, (50, 50, 50), (x, y, POSTER_WIDTH, POSTER_HEIGHT))
-
-            # Draw a white border around the selected game poster
-            if i == selected_game:
-                border_rect = pygame.Rect(x - 2, y - 2, POSTER_WIDTH + 4, POSTER_HEIGHT + 4)
-                pygame.draw.rect(screen, (169, 169, 169), border_rect)
-
-            try:
-                poster = pygame.image.load(game["poster_path"])
-                poster = pygame.transform.scale(poster, (POSTER_WIDTH, POSTER_HEIGHT))
-                screen.blit(poster, (x, y))
-            except:
-                font = pygame.font.Font(None, 24)
-                text_lines = render_wrapped_text(game["name"], font, POSTER_WIDTH - 10, POSTER_HEIGHT - 10, (255, 255, 255))
-                
-                text_y = y + (POSTER_HEIGHT - sum(line.get_height() for line in text_lines)) // 2
-                for line in text_lines:
-                    text_x = x + (POSTER_WIDTH - line.get_width()) // 2
-                    screen.blit(line, (text_x, text_y))
-                    text_y += line.get_height()
-
-    # Scrolling logic for keyboard and controller
-    selected_row = selected_game // GAMES_PER_ROW
-    if selected_row < scroll_offset // (POSTER_HEIGHT + MARGIN):
-        scroll_offset = selected_row * (POSTER_HEIGHT + MARGIN)
-    elif selected_row >= (scroll_offset + screen.get_height()) // (POSTER_HEIGHT + MARGIN):
-        scroll_offset = (selected_row + 1) * (POSTER_HEIGHT + MARGIN) - screen.get_height()
-
-    # Update the display
-    pygame.display.flip()
-
-pygame.quit()
+if __name__ == "__main__":
+    main()
